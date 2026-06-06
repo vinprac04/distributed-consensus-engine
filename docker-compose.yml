@@ -1,0 +1,263 @@
+# ============================================================
+# Docker Compose - Orchestrates the entire distributed system
+# ============================================================
+#
+# What this file does:
+#   - Defines 5 consensus nodes (node1 to node5)
+#   - Defines 1 adversary (malicious) node
+#   - Defines 1 client that submits transactions
+#   - Defines 1 Toxiproxy for simulating network faults
+#   - Puts all containers on the same virtual network
+#
+# How to use:
+#   docker-compose build     → Build all container images
+#   docker-compose up        → Start everything (shows logs)
+#   docker-compose up -d     → Start in background
+#   docker-compose down      → Stop everything
+#   docker-compose down -v   → Stop + delete saved data
+#   docker-compose stop node3  → Kill one specific node
+#   docker-compose start node3 → Bring it back
+#   docker-compose logs -f node5 → Watch one node's output
+#
+# ============================================================
+
+services:
+
+  # ============================================================
+  # NODE 1 — Consensus Node (lowest priority in election)
+  # ============================================================
+  # This is a regular honest node. It participates in:
+  #   - Leader election (will only become leader if nodes 2-5 are dead)
+  #   - Paxos/PBFT consensus (votes on transactions)
+  #   - Stores committed transactions in /app/data/
+  node1:
+    build: .
+    # 'build: .' means "use the Dockerfile in current folder to build this container"
+
+    container_name: node1
+    # Fixed name so other nodes can find it by hostname 'node1'
+
+    environment:
+      - NODE_ID=1
+        # Unique identifier. Used in leader election (higher ID = higher priority)
+      - PEERS=node2:5000,node3:5000,node4:5000,node5:5000
+        # List of all OTHER nodes this node should talk to
+        # Format: hostname:port (Docker resolves hostnames automatically)
+      - MODE=paxos
+        # Which consensus protocol to use: 'paxos' or 'pbft'
+        # paxos = crash fault tolerance (handles dead nodes)
+        # pbft = byzantine fault tolerance (handles lying nodes)
+
+    networks:
+      - consensus-net
+      # Connects this container to our virtual network (defined at bottom)
+      # All containers on the same network can talk to each other by hostname
+
+    volumes:
+      - node1-data:/app/data
+      # Persistent storage: ledger data survives container restarts
+      # Maps the Docker volume 'node1-data' to /app/data inside the container
+
+    restart: unless-stopped
+    # If the container crashes, Docker will automatically restart it
+    # (unless you manually stopped it with docker-compose stop)
+
+  # ============================================================
+  # NODE 2 — Consensus Node
+  # ============================================================
+  node2:
+    build: .
+    container_name: node2
+    environment:
+      - NODE_ID=2
+      - PEERS=node1:5000,node3:5000,node4:5000,node5:5000
+      - MODE=paxos
+    networks:
+      - consensus-net
+    volumes:
+      - node2-data:/app/data
+    restart: unless-stopped
+
+  # ============================================================
+  # NODE 3 — Consensus Node
+  # ============================================================
+  node3:
+    build: .
+    container_name: node3
+    environment:
+      - NODE_ID=3
+      - PEERS=node1:5000,node2:5000,node4:5000,node5:5000
+      - MODE=paxos
+    networks:
+      - consensus-net
+    volumes:
+      - node3-data:/app/data
+    restart: unless-stopped
+
+  # ============================================================
+  # NODE 4 — Consensus Node (second highest priority)
+  # ============================================================
+  # If node5 crashes, node4 becomes the new leader
+  node4:
+    build: .
+    container_name: node4
+    environment:
+      - NODE_ID=4
+      - PEERS=node1:5000,node2:5000,node3:5000,node5:5000
+      - MODE=paxos
+    networks:
+      - consensus-net
+    volumes:
+      - node4-data:/app/data
+    restart: unless-stopped
+
+  # ============================================================
+  # NODE 5 — Consensus Node (HIGHEST priority = default leader)
+  # ============================================================
+  # Node 5 always wins the initial election because it has the
+  # highest NODE_ID. The Bully Algorithm says "highest ID = leader"
+  node5:
+    build: .
+    container_name: node5
+    environment:
+      - NODE_ID=5
+      - PEERS=node1:5000,node2:5000,node3:5000,node4:5000
+      - MODE=paxos
+    networks:
+      - consensus-net
+    volumes:
+      - node5-data:/app/data
+    restart: unless-stopped
+
+  # ============================================================
+  # ADVERSARY — Malicious Byzantine Node
+  # ============================================================
+  # This node LOOKS like a normal node but intentionally breaks
+  # the protocol. It's used to test if PBFT can handle liars.
+  #
+  # Attack modes:
+  #   equivocate = send different values to different peers
+  #   suppress   = randomly drop messages (stay silent)
+  #   forge      = inject fake transactions
+  adversary:
+    build: .
+    container_name: adversary
+
+    command: python -m src.adversary
+    # Override: run adversary.py instead of the default node.py
+
+    environment:
+      - NODE_ID=0
+        # ID 0 = lower than all honest nodes (1-5) so it never wins the Bully election
+      - PEERS=node1:5000,node2:5000,node3:5000,node4:5000,node5:5000
+        # The adversary connects to all honest nodes
+      - MODE=pbft
+        # Adversary operates in PBFT mode (that's where it attacks)
+      - IS_ADVERSARY=true
+        # Flag to identify this as the malicious node
+      - ATTACK_MODE=equivocate
+        # Which attack to perform (equivocate/suppress/forge)
+
+    networks:
+      - consensus-net
+
+    depends_on:
+      - node1
+      - node2
+      - node3
+      - node4
+      - node5
+    # Wait for all honest nodes to start before starting the adversary
+
+    restart: unless-stopped
+
+  # ============================================================
+  # CLIENT — Transaction Submitter
+  # ============================================================
+  # This is NOT a consensus node. It just sends transactions
+  # to the leader and reports if they were committed or not.
+  client:
+    build: .
+    container_name: client
+
+    command: python -m src.client
+    # Override: run client.py instead of node.py
+
+    environment:
+      - LEADER_HOST=node5
+        # Initial leader to connect to (node5 = highest ID = first leader)
+      - LEADER_PORT=5000
+        # All nodes listen on port 5000
+      - ALL_NODES=node1:5000,node2:5000,node3:5000,node4:5000,node5:5000
+        # Used to find the new leader if the current one crashes
+      - MODE=paxos
+
+    networks:
+      - consensus-net
+
+    depends_on:
+      - node1
+      - node2
+      - node3
+      - node4
+      - node5
+    # Client starts only after all nodes are up
+
+  # ============================================================
+  # TOXIPROXY — Network Fault Simulator
+  # ============================================================
+  # Toxiproxy sits between nodes and can inject:
+  #   - Latency (slow messages)
+  #   - Packet loss (drop messages)
+  #   - Timeout (complete network partition)
+  #
+  # You control it via HTTP API on port 8474:
+  #   curl http://localhost:8474/proxies  → list all proxies
+  #   POST to add toxic (fault)
+  #   DELETE to remove toxic (heal)
+  #
+  # The chaos_test.sh script uses this API automatically.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    # Pre-built image from Shopify (no build needed)
+
+    container_name: toxiproxy
+
+    ports:
+      - "8474:8474"
+    # Expose Toxiproxy's API to your host machine
+    # So you can run curl commands from your terminal
+    # Format: "host_port:container_port"
+
+    networks:
+      - consensus-net
+
+# ============================================================
+# NETWORK — Virtual network connecting all containers
+# ============================================================
+# All containers on 'consensus-net' can reach each other by
+# container name. For example, node1 can connect to node2
+# using hostname 'node2' and port 5000.
+#
+# Docker handles DNS automatically — you don't need IP addresses.
+networks:
+  consensus-net:
+    driver: bridge
+    # 'bridge' = standard Docker network. All containers get a
+    # virtual IP and can talk to each other. Isolated from host
+    # network by default (except exposed ports like 8474).
+
+# ============================================================
+# VOLUMES — Persistent storage for ledger data
+# ============================================================
+# Without volumes, all data is lost when containers stop.
+# Volumes keep the ledger files alive across restarts.
+# Each node gets its own volume so ledgers don't overwrite each other.
+#
+# To delete all stored data: docker-compose down -v
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
