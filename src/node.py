@@ -1,54 +1,6 @@
 """
 Main Consensus Node — the core of the distributed consensus engine.
-
-Architecture overview
----------------------
-Each Node runs 4 permanent threads:
-
-  Thread 1 — TCP Server
-    Listens on port 5000 for incoming connections.  Every connection is
-    dispatched to a short-lived handler thread that reads one JSON message,
-    routes it to the appropriate handler method, and writes back a response
-    if the handler returns one.
-
-  Thread 2 — Heartbeat Loop
-    If this node is the current leader it broadcasts a heartbeat to all peers
-    every 1 second.  Followers use this signal to know the leader is alive.
-
-  Thread 3 — Monitor Loop
-    Followers watch the timestamp of the last received heartbeat.  If no
-    heartbeat arrives for 3 seconds they conclude the leader has crashed and
-    trigger a new election.
-
-  Thread 4 — Key Exchange (one-shot at startup)
-    Sends this node's RSA public key to all peers so they can later verify
-    PBFT message signatures.
-
-Consensus modes
----------------
-  paxos (default) — Crash Fault Tolerant.
-    Tolerates up to ⌊(N−1)/2⌋ node *crashes*.  With N=5, that's 2 crashes.
-    Uses two phases: Prepare/Promise then Accept/Accepted, coordinated by
-    the elected leader.
-
-  pbft — Byzantine Fault Tolerant.
-    Tolerates up to ⌊(N−1)/3⌋ Byzantine (lying/arbitrary) nodes.  With N=5,
-    f=1.  Uses three phases: Pre-Prepare → Prepare → Commit, each requiring
-    a quorum of 2f+1 = 3 matching messages.
-
-Leader election
----------------
-  Uses the Bully Algorithm: when a follower detects a dead leader it sends
-  ELECTION to all higher-ID nodes.  If any respond with ALIVE, they take over.
-  If none respond, this node declares itself leader with a COORDINATOR message.
-  The highest-ID alive node always wins, which guarantees no split-brain.
-
-Thread safety
--------------
-  All mutable consensus state (proposal numbers, promise/accept response lists,
-  PBFT message logs, ledger) is protected by a single threading.Lock (self.lock).
-  Handlers acquire the lock only for the critical section, release it before
-  performing any I/O (send_message calls) to avoid deadlocks.
+See NODE_BRAIN_MAP.md for a full method index, call chains, and state-variable reference.
 """
 
 import socket
@@ -57,6 +9,7 @@ import json
 import os
 import time
 import hashlib
+from datetime import datetime
 
 from src.crypto_utils import generate_keypair, sign_message, verify_signature, key_to_string, string_to_key
 
@@ -153,6 +106,7 @@ class Node:
         self.commit_messages = {}
         self.pre_prepare_log = {}
         self.committed_seqs = set()
+        self.commit_thread_started = set()  # seqs for which a commit thread was already spawned
         self.f = 1
         self.quorum = 2 * self.f + 1  # = 3 matching messages required
 
@@ -167,6 +121,22 @@ class Node:
 
         # Single re-entrant-safe lock guarding all mutable state above.
         self.lock = threading.Lock()
+
+        # Admin server flag — set via HTTP POST /pause or /resume
+        self.heartbeat_paused = False
+
+    # ===================================================================
+    # LOGGING HELPER
+    # ===================================================================
+
+    @property
+    def _role(self):
+        return 'LEADER  ' if self.is_leader else 'follower'
+
+    def log(self, msg):
+        """Timestamped, role-aware print for every node event."""
+        ts = datetime.now().strftime('%H:%M:%S')
+        print(f"[{ts}] [Node-{self.node_id} | {self._role}] {msg}")
 
     # ===================================================================
     # NETWORKING — Low-level socket helpers
@@ -258,7 +228,7 @@ class Node:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((self.host, self.port))
         server.listen(10)
-        print(f"[Node {self.node_id}] Server listening on port {self.port}")
+        self.log(f"TCP server ready — listening on port {self.port}")
 
         while True:
             try:
@@ -267,7 +237,7 @@ class Node:
                 t.daemon = True
                 t.start()
             except Exception as e:
-                print(f"[Node {self.node_id}] Server error: {e}")
+                self.log(f"Server error: {e}")
 
     def handle_connection(self, client_socket):
         """
@@ -333,7 +303,7 @@ class Node:
         if handler:
             return handler(message)
         else:
-            print(f"[Node {self.node_id}] Unknown message type: {msg_type}")
+            self.log(f"Unknown message type received: '{msg_type}' — ignoring")
             return None
 
     # ===================================================================
@@ -353,12 +323,12 @@ class Node:
 
     def heartbeat_loop(self):
         """
-        Thread 2: Broadcast a heartbeat every 1 second while leader.
+        Thread 2: Broadcast a heartbeat every 3 seconds while leader.
 
-        The heartbeat serves two purposes:
-          1. Tells followers the leader is still alive (resets their timeout).
-          2. Carries the leader_id so a node that missed the COORDINATOR
-             message can still learn who the leader is.
+        Increased to 3 s (from 1 s) so the demo log is easier to read —
+        followers won't flood with heartbeat noise.  The monitor timeout is
+        set to 9 s (3× the interval) so a single missed heartbeat doesn't
+        trigger a false election.
         """
         while True:
             if self.is_leader:
@@ -367,26 +337,27 @@ class Node:
                     'sender': self.node_id,
                     'leader_id': self.node_id
                 })
-            time.sleep(1)
+            time.sleep(3)
 
     def monitor_loop(self):
         """
         Thread 3: Watch for a dead leader and trigger re-election.
 
-        Waits 5 seconds at startup to let the cluster initialise and elect
-        a leader before beginning to watch.  After that, if more than 3 seconds
-        pass without a heartbeat (and this node isn't the leader itself),
-        it assumes the leader has crashed and starts an election.
+        Waits 8 seconds at startup so the cluster has time to elect a leader
+        before any follower starts checking.  After that, if 9 seconds pass
+        without a heartbeat the leader is assumed crashed and an election starts.
 
-        3-second deadline is chosen to be noticeably longer than the 1-second
-        heartbeat interval, so transient network delays don't cause false alarms.
+        9-second deadline = 3× the 3-second heartbeat interval, giving the
+        leader two missed beats before followers react.  This prevents false
+        alarms from a single delayed heartbeat while keeping recovery fast
+        enough for a live demo (~9s after crash).
         """
-        time.sleep(5)
+        time.sleep(8)
         while True:
             if not self.is_leader:
                 elapsed = time.time() - self.last_heartbeat
-                if elapsed > 3.0:
-                    print(f"[Node {self.node_id}] Leader timeout! Starting election...")
+                if elapsed > 9.0:
+                    self.log(f"No heartbeat for 9s — leader assumed crashed. Starting Bully election...")
                     self.start_election()
             time.sleep(1)
 
@@ -449,7 +420,7 @@ class Node:
         """
         self.is_leader = True
         self.leader_id = self.node_id
-        print(f"[Node {self.node_id}] *** I AM THE NEW LEADER ***")
+        self.log(f"★  WON ELECTION — I am the new leader. Notifying all {len(self.peers)} peers.")
         self.broadcast({
             'type': 'coordinator',
             'sender': self.node_id,
@@ -489,7 +460,7 @@ class Node:
         self.is_leader = (self.leader_id == self.node_id)
         self.last_heartbeat = time.time()
         self.election_in_progress = False
-        print(f"[Node {self.node_id}] Leader is now Node {self.leader_id}")
+        self.log(f"New leader accepted: Node {self.leader_id}")
         return None
 
     # ===================================================================
@@ -534,7 +505,7 @@ class Node:
 
         prop_num = self.proposal_number
 
-        print(f"[Node {self.node_id}] PAXOS Phase 1: PREPARE(n={prop_num})")
+        self.log(f"PAXOS Ph.1/2 — Sending PREPARE #{prop_num} to all peers: 'may I propose?'")
 
         # Phase 1 — Prepare: tell all followers "I want to propose with number n".
         self.broadcast({
@@ -561,7 +532,7 @@ class Node:
         if promises < 3:
             # Didn't reach majority — another proposer may have stolen our
             # proposal number, or too many nodes are down.  Give up this round.
-            print(f"[Node {self.node_id}] PAXOS failed: only {promises} promises (need 3)")
+            self.log(f"PAXOS Ph.1 FAILED — only {promises}/5 nodes promised (need majority=3). Aborting round.")
             return False
 
         # Paxos safety: if any Promise carries a previously accepted value, we
@@ -574,7 +545,7 @@ class Node:
                 value = highest['accepted_value']
 
         # Phase 2 — Accept: ask followers to accept (n, value).
-        print(f"[Node {self.node_id}] PAXOS Phase 2: ACCEPT(n={prop_num}, v='{value}')")
+        self.log(f"PAXOS Ph.2/2 — {promises}/5 nodes said YES. Sending ACCEPT #{prop_num} with value to all.")
         self.broadcast({
             'type': 'paxos_accept',
             'sender': self.node_id,
@@ -595,12 +566,12 @@ class Node:
 
         if accepted >= 3:
             # Majority accepted — commit to ledger and tell all nodes.
-            print(f"[Node {self.node_id}] PAXOS CONSENSUS REACHED: '{value}'")
+            self.log(f"PAXOS CONSENSUS REACHED — '{value}' committed. Broadcasting COMMIT to all nodes.")
             self.commit_to_ledger(value)
             self.broadcast({'type': 'paxos_commit', 'sender': self.node_id, 'value': value})
             return True
 
-        print(f"[Node {self.node_id}] PAXOS failed: only {accepted} accepted (need 3)")
+        self.log(f"PAXOS Ph.2 FAILED — only {accepted}/5 nodes accepted (need majority=3). Aborting.")
         return False
 
     # --- Paxos message handlers ---
@@ -615,6 +586,7 @@ class Node:
         with self.lock:
             if prop_num > self.highest_promised:
                 self.highest_promised = prop_num
+                self.log(f"PAXOS Ph.1 — PREPARE #{prop_num} from Node {sender} accepted. Sending PROMISE (won't accept < #{prop_num})")
                 self.send_message(sender, {
                     'type': 'paxos_promise',
                     'sender': self.node_id,
@@ -622,12 +594,16 @@ class Node:
                     'accepted_proposal': self.accepted_proposal,
                     'accepted_value': self.accepted_value
                 })
+            else:
+                self.log(f"PAXOS Ph.1 — PREPARE #{prop_num} from Node {sender} REJECTED (already promised #{self.highest_promised})")
         return None
 
     def handle_paxos_promise(self, message):
         """Collect Promise responses during Phase 1."""
         with self.lock:
             self.promise_responses.append(message)
+            count = len(self.promise_responses)
+        self.log(f"PAXOS Ph.1 — PROMISE received from Node {message['sender']} (#{message['proposal_number']}) — {count} promises so far")
         return None
 
     def handle_paxos_accept(self, message):
@@ -638,21 +614,27 @@ class Node:
         """
         prop_num = message['proposal_number']
         sender = message['sender']
+        value = message['value']
         with self.lock:
             if prop_num >= self.highest_promised:
                 self.accepted_proposal = prop_num
-                self.accepted_value = message['value']
+                self.accepted_value = value
+                self.log(f"PAXOS Ph.2 — ACCEPT #{prop_num} from Node {sender}. Accepting value: '{value}'. Sending ACCEPTED.")
                 self.send_message(sender, {
                     'type': 'paxos_accepted',
                     'sender': self.node_id,
                     'proposal_number': prop_num
                 })
+            else:
+                self.log(f"PAXOS Ph.2 — ACCEPT #{prop_num} from Node {sender} REJECTED (promised #{self.highest_promised}, won't go back)")
         return None
 
     def handle_paxos_accepted(self, message):
         """Collect Accepted responses during Phase 2."""
         with self.lock:
             self.accepted_responses.append(message)
+            count = len(self.accepted_responses)
+        self.log(f"PAXOS Ph.2 — ACCEPTED from Node {message['sender']} (#{message['proposal_number']}) — {count} acceptances so far")
         return None
 
     def handle_paxos_commit(self, message):
@@ -661,7 +643,9 @@ class Node:
         All followers (including those that may have missed Phase 2) apply
         the committed value to their ledger.
         """
-        self.commit_to_ledger(message['value'])
+        value = message['value']
+        self.log(f"PAXOS COMMIT — Leader says '{value}' is decided. Writing to ledger.")
+        self.commit_to_ledger(value)
         return None
 
     # ===================================================================
@@ -738,7 +722,7 @@ class Node:
             'signature': signature
         }
 
-        print(f"[Node {self.node_id}] PBFT Pre-Prepare: seq={seq}")
+        self.log(f"PBFT Ph.1/3 — PRE-PREPARE: seq={seq} assigned, SHA-256 digest computed, broadcasting to all.")
         with self.lock:
             self.pre_prepare_log[seq] = pre_prepare
         self.broadcast(pre_prepare)
@@ -827,7 +811,7 @@ class Node:
             self.committed_seqs.add(seq)
             transaction = self.pre_prepare_log[seq]['transaction']
             self.commit_to_ledger(transaction)
-            print(f"[Node {self.node_id}] PBFT COMMITTED: seq={seq}, tx='{transaction}'")
+            self.log(f"PBFT Ph.3 DONE — seq={seq} COMMITTED (got {self.quorum}+ commits). TX: '{transaction}'")
 
     # --- PBFT message handlers ---
 
@@ -851,13 +835,13 @@ class Node:
 
         expected = self.compute_digest(transaction)
         if digest != expected:
-            print(f"[Node {self.node_id}] PBFT: Digest mismatch! Ignoring.")
+            self.log(f"PBFT ALERT — Digest mismatch in PRE-PREPARE! Discarding message. (Byzantine node?)")
             return None
 
         with self.lock:
             self.pre_prepare_log[seq] = message
 
-        print(f"[Node {self.node_id}] PBFT Prepare: seq={seq}")
+        self.log(f"PBFT Ph.2/3 — PREPARE: digest verified for seq={seq}, sending my vote to all.")
         self.send_pbft_prepare(seq, digest)
         return None
 
@@ -885,7 +869,7 @@ class Node:
             if seq in self.pre_prepare_log:
                 expected = self.pre_prepare_log[seq]['digest']
                 if digest != expected:
-                    print(f"[Node {self.node_id}] PBFT: Prepare digest mismatch from node {sender}. Ignoring.")
+                    self.log(f"PBFT ALERT — Node {sender} sent wrong digest for seq={seq} (equivocation!). Discarding.")
                     return None
 
             if seq not in self.prepare_messages:
@@ -895,8 +879,9 @@ class Node:
             if not already:
                 self.prepare_messages[seq].append(message)
 
-            if len(self.prepare_messages[seq]) >= self.quorum and seq not in self.committed_seqs:
-                print(f"[Node {self.node_id}] PBFT: Prepare quorum for seq={seq}")
+            if len(self.prepare_messages[seq]) >= self.quorum and seq not in self.commit_thread_started:
+                self.commit_thread_started.add(seq)
+                self.log(f"PBFT Ph.2/3 — Prepare quorum for seq={seq} (3+ matching votes). Moving to Commit phase.")
                 threading.Thread(target=self.send_pbft_commit, args=(seq,), daemon=True).start()
 
         return None
@@ -945,7 +930,7 @@ class Node:
           'error'      — this node is not the leader; client should retry elsewhere.
         """
         transaction = message.get('transaction', '')
-        print(f"[Node {self.node_id}] Client request: '{transaction}'")
+        self.log(f"New transaction from client: '{transaction}' — starting {self.mode.upper()} consensus round")
 
         if not self.is_leader:
             return {'status': 'error', 'message': 'Not leader'}
@@ -999,18 +984,28 @@ class Node:
         """
         time.sleep(3)
         pub_key_str = key_to_string(self.public_key)
+        # Show a short fingerprint (first 20 chars of the base64 body) so logs
+        # are readable without printing the full 400-char PEM block.
+        fingerprint = pub_key_str.strip().split('\n')[1][:20]
+        self.log(f"KEY EXCHANGE — Broadcasting RSA-2048 public key to {len(self.peers)} peers (fingerprint: {fingerprint}...)")
         self.broadcast({
             'type': 'key_exchange',
             'sender': self.node_id,
             'public_key': pub_key_str
         })
+        self.log(f"KEY EXCHANGE — Public key broadcast sent")
 
     def handle_key_exchange(self, message):
         """Store a peer's public key for future signature verification."""
         sender = message['sender']
         pub_key = string_to_key(message['public_key'])
         self.peer_public_keys[sender] = pub_key
-        print(f"[Node {self.node_id}] Got public key from Node {sender}")
+        fingerprint = message['public_key'].strip().split('\n')[1][:20]
+        known = len(self.peer_public_keys)
+        total = len(self.peers)
+        self.log(f"KEY EXCHANGE — Received RSA public key from Node {sender} (fingerprint: {fingerprint}...) — {known}/{total} peers authenticated")
+        if known == total:
+            self.log(f"KEY EXCHANGE — All {total} peers authenticated. Cluster crypto handshake complete!")
         return None
 
     # ===================================================================
@@ -1038,7 +1033,12 @@ class Node:
             os.makedirs(os.path.dirname(self.ledger_file), exist_ok=True)
             with open(self.ledger_file, 'w') as f:
                 json.dump(self.ledger, f, indent=2)
-            print(f"[Node {self.node_id}] Ledger: {len(self.ledger)} entries")
+            self.log(f"Ledger updated — {len(self.ledger)} total committed transactions on disk")
+        # Clear accepted state so the next Paxos round doesn't inherit this
+        # committed value and re-propose it instead of the new transaction.
+        # Once a value is in the ledger it no longer needs Paxos recovery.
+        self.accepted_proposal = 0
+        self.accepted_value = None
 
     # ===================================================================
     # STARTUP — Launch all threads
@@ -1062,8 +1062,7 @@ class Node:
         daemon threads continue running.  In Python, daemon threads are killed
         as soon as the non-daemon main thread exits.
         """
-        print(f"[Node {self.node_id}] Starting in {self.mode.upper()} mode")
-        print(f"[Node {self.node_id}] Peers: {list(self.peers.keys())}")
+        self.log(f"Starting up in {self.mode.upper()} mode | Known peers: {list(self.peers.keys())}")
 
         t1 = threading.Thread(target=self.start_server, daemon=True)
         t1.start()
@@ -1077,7 +1076,7 @@ class Node:
         t4 = threading.Thread(target=self.exchange_keys, daemon=True)
         t4.start()
 
-        print(f"[Node {self.node_id}] All threads started. Running...")
+        self.log(f"All 4 threads running (server | heartbeat | monitor | key-exchange) — cluster ready")
         while True:
             time.sleep(1)
 
