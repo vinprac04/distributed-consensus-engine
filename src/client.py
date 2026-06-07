@@ -20,6 +20,11 @@ import socket
 import json
 import os
 import time
+from datetime import datetime
+
+def ts():
+    """Current time as HH:MM:SS for log prefixes."""
+    return datetime.now().strftime('%H:%M:%S')
 
 # ---------------------------------------------------------------------------
 # Configuration — pulled from environment so Docker Compose can override them
@@ -79,15 +84,15 @@ def send_to_node(host, port, message):
     except socket.timeout:
         # Node is up but not answering — could be overloaded or doing an
         # election.  We log and return None; caller will retry or skip.
-        print(f"  Timeout connecting to {host}:{port}")
+        print(f"[{ts()}] [CLIENT] Timeout connecting to {host}:{port} — node may be busy or starting")
         return None
     except ConnectionRefusedError:
         # Node process isn't listening — it may still be starting up or it
         # crashed.  Common during the first few seconds after `docker compose up`.
-        print(f"  Connection refused by {host}:{port}")
+        print(f"[{ts()}] [CLIENT] Connection refused by {host}:{port} — node not ready yet")
         return None
     except Exception as e:
-        print(f"  Error: {e}")
+        print(f"[{ts()}] [CLIENT] Error talking to {host}:{port}: {e}")
         return None
 
 
@@ -124,28 +129,23 @@ def find_leader():
 
 
 def main():
-    print("=" * 50)
-    print("  DISTRIBUTED CONSENSUS CLIENT")
-    print("=" * 50)
+    print(f"[{ts()}] {'=' * 54}")
+    print(f"[{ts()}]   DISTRIBUTED CONSENSUS CLIENT — starting up")
+    print(f"[{ts()}] {'=' * 54}")
     print()
 
     # -----------------------------------------------------------------------
     # Step 1 — Give the cluster time to elect its first leader.
-    #
-    # Raft needs a majority of nodes to exchange votes before one node becomes
-    # leader.  With 5 nodes that's 3 votes; the election timeout is randomised
-    # (150–300 ms typically) to avoid split votes.  In practice the whole
-    # process takes well under a second, but Docker container start-up adds
-    # latency.  10 seconds is a conservative safety margin.
+    # The Bully Algorithm needs ~8s to elect a leader after containers start.
     # -----------------------------------------------------------------------
-    print("[CLIENT] Waiting 10 seconds for cluster to stabilize...")
-    time.sleep(10)
+    print(f"[{ts()}] [CLIENT] Waiting 15 seconds for cluster to boot and elect a leader...")
+    time.sleep(15)
 
     # -----------------------------------------------------------------------
     # Step 2 — Locate the current leader.
     # -----------------------------------------------------------------------
     leader_host, leader_port = find_leader()
-    print(f"[CLIENT] Leader found at {leader_host}:{leader_port}")
+    print(f"[{ts()}] [CLIENT] Leader discovered at {leader_host}:{leader_port}")
     print()
 
     # -----------------------------------------------------------------------
@@ -194,29 +194,23 @@ def main():
     failed = 0
 
     for i, tx in enumerate(transactions, 1):
-        print(f"[CLIENT] [{i}/{len(transactions)}] Submitting: {tx}")
+        print(f"[{ts()}] [CLIENT] [{i}/{len(transactions)}] Submitting: {tx}")
 
-        # Send a client_request to the leader.  The node will:
-        #   1. Append the transaction to its local Raft log.
-        #   2. Broadcast AppendEntries RPCs to all followers.
-        #   3. Wait for a majority to acknowledge → entry is now "committed".
-        #   4. Apply the entry to the state machine and reply 'committed'.
         result = send_to_node(leader_host, leader_port, {
             'type': 'client_request',
             'transaction': tx
         })
 
         if result and result.get('status') == 'committed':
-            # Happy path — the transaction reached a majority of nodes.
             committed += 1
-            print(f"  -> COMMITTED")
+            print(f"[{ts()}] [CLIENT]   -> COMMITTED  ✓  (majority of nodes agreed)")
 
         elif result and result.get('status') == 'error':
-            # The node we thought was leader is no longer in charge.
-            # Re-discover the new leader and attempt the transaction once more.
-            print(f"  -> Error: {result.get('message')}")
-            print("  -> Searching for new leader...")
+            # Leader stepped down — re-discover and retry once.
+            print(f"[{ts()}] [CLIENT]   -> Node rejected request: {result.get('message')}")
+            print(f"[{ts()}] [CLIENT]   -> Leader changed — searching for new leader...")
             leader_host, leader_port = find_leader()
+            print(f"[{ts()}] [CLIENT]   -> New leader at {leader_host}:{leader_port} — retrying...")
 
             result = send_to_node(leader_host, leader_port, {
                 'type': 'client_request',
@@ -224,15 +218,15 @@ def main():
             })
             if result and result.get('status') == 'committed':
                 committed += 1
-                print(f"  -> COMMITTED (retry)")
+                print(f"[{ts()}] [CLIENT]   -> COMMITTED  ✓  (on retry)")
             else:
                 failed += 1
-                print(f"  -> FAILED")
+                print(f"[{ts()}] [CLIENT]   -> FAILED  ✗  (retry also failed)")
 
         else:
             # No response — node unreachable or crashed before replying.
             failed += 1
-            print(f"  -> FAILED (no response)")
+            print(f"[{ts()}] [CLIENT]   -> FAILED  ✗  (no response — node may be down)")
 
         # Brief pause between submissions so the leader has time to finish the
         # AppendEntries round-trip and apply the committed entry before the
@@ -243,10 +237,11 @@ def main():
     # Step 5 — Print final summary.
     # -----------------------------------------------------------------------
     print()
-    print("=" * 50)
-    print(f"  DONE: {committed} committed, {failed} failed")
-    print(f"  Total: {len(transactions)} transactions")
-    print("=" * 50)
+    print(f"[{ts()}] {'=' * 54}")
+    print(f"[{ts()}]   RESULT: {committed} committed  |  {failed} failed  |  {len(transactions)} total")
+    verdict = 'ALL PASSED' if failed == 0 else f'{failed} FAILED — check node logs'
+    print(f"[{ts()}]   STATUS: {verdict}")
+    print(f"[{ts()}] {'=' * 54}")
 
 
 if __name__ == '__main__':

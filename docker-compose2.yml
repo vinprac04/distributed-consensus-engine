@@ -149,8 +149,10 @@ services:
     # Override: run adversary.py instead of the default node.py
 
     environment:
-      - NODE_ID=6
-        # ID 6 = higher than all honest nodes (could win elections!)
+      - NODE_ID=0
+        # ID 0 = lower than all honest nodes, so it never wins elections.
+        # The adversary attacks only at the PBFT message level (equivocation/
+        # suppress/forge) without disrupting the Bully leader election.
       - PEERS=node1:5000,node2:5000,node3:5000,node4:5000,node5:5000
         # The adversary connects to all honest nodes
       - MODE=pbft
